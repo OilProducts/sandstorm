@@ -65,13 +65,15 @@ fn setup_scene(
 ) {
     commands.insert_resource(AmbientLight {
         color: Color::srgb(1.0, 1.0, 1.0),
-        brightness: 0.35,
+        brightness: 0.60,
         ..default()
     });
 
     commands.spawn((
         DirectionalLight {
-            shadows_enabled: true,
+            // Shadows from thousands of voxels tend to obscure the sim. Keeping this off also
+            // ensures the "inside of the box" stays readable.
+            shadows_enabled: false,
             illuminance: 20_000.0,
             ..default()
         },
@@ -89,9 +91,44 @@ fn setup_scene(
     let center = config.origin + Vec3::new(size_x * 0.5, size_y * 0.5, size_z * 0.5);
     let wall_thickness = config.cell_size * 0.5;
 
+    // Interior fill lights to keep particles visible inside the container.
+    let light_range = size_x.max(size_y).max(size_z) * 1.8;
+    commands.spawn((
+        PointLight {
+            intensity: 18_000.0,
+            range: light_range,
+            color: Color::srgb(1.0, 0.95, 0.90),
+            shadows_enabled: false,
+            ..default()
+        },
+        Transform::from_translation(center + Vec3::new(0.0, size_y * 0.80, 0.0)),
+    ));
+    commands.spawn((
+        PointLight {
+            intensity: 8_000.0,
+            range: light_range,
+            color: Color::srgb(0.70, 0.80, 1.0),
+            shadows_enabled: false,
+            ..default()
+        },
+        Transform::from_translation(
+            center + Vec3::new(-size_x * 0.25, size_y * 0.25, size_z * 0.25),
+        ),
+    ));
+
     let container_material = materials.add(StandardMaterial {
         base_color: Color::srgb(0.10, 0.10, 0.12),
         perceptual_roughness: 0.95,
+        ..default()
+    });
+
+    // Make the "front" wall (positive Z, where the camera starts) transparent so you can see inside
+    // without having to fly into the container.
+    let front_wall_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.10, 0.12, 0.14, 0.08),
+        alpha_mode: AlphaMode::Blend,
+        cull_mode: None,
+        perceptual_roughness: 0.15,
         ..default()
     });
 
@@ -145,7 +182,7 @@ fn setup_scene(
     ));
     commands.spawn((
         Mesh3d(particle_meshes.cube.clone()),
-        MeshMaterial3d(container_material.clone()),
+        MeshMaterial3d(front_wall_material),
         Transform::from_translation(Vec3::new(
             center.x,
             center.y,
