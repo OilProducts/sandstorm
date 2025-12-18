@@ -550,19 +550,24 @@ fn step_fluid(
         }
     }
 
+    // Prevent isolated single-cell fluids from doing a random walk when resting on a flat surface.
+    // Only allow sideways spreading when either:
+    // - there is something above this cell (pressure), or
+    // - this particle is connected to at least one same-kind neighbor, and the move keeps it connected.
+    let has_above = grid.get(cell + IVec3::Y).is_some();
+    if !has_above && !has_same_kind_neighbor(cell, kind, grid, kinds) {
+        return false;
+    }
+
     let start_side = (hash_u64((tick << 2) ^ pack_cell(cell)) as usize) % OFFSETS_SIDE.len();
     for i in 0..OFFSETS_SIDE.len() {
         let offset = OFFSETS_SIDE[(start_side + i) % OFFSETS_SIDE.len()];
+        let to = cell + offset;
+        if !has_above && !would_have_same_kind_neighbor_after_move(to, cell, kind, grid, kinds) {
+            continue;
+        }
         if try_move_or_swap(
-            entity,
-            cell,
-            cell + offset,
-            kind,
-            grid,
-            config,
-            kinds,
-            particles,
-            moved,
+            entity, cell, to, kind, grid, config, kinds, particles, moved,
         ) {
             return true;
         }
@@ -717,6 +722,64 @@ fn try_move_or_swap(
             true
         }
     }
+}
+
+const CONNECTED_NEIGHBORS: [IVec3; 10] = [
+    IVec3::new(1, 0, 0),
+    IVec3::new(-1, 0, 0),
+    IVec3::new(0, 0, 1),
+    IVec3::new(0, 0, -1),
+    IVec3::new(1, 0, 1),
+    IVec3::new(1, 0, -1),
+    IVec3::new(-1, 0, 1),
+    IVec3::new(-1, 0, -1),
+    IVec3::new(0, 1, 0),
+    IVec3::new(0, -1, 0),
+];
+
+fn has_same_kind_neighbor(
+    cell: IVec3,
+    kind: ParticleKind,
+    grid: &VoxelGrid,
+    kinds: &Query<&Particle>,
+) -> bool {
+    for offset in CONNECTED_NEIGHBORS {
+        let Some(entity) = grid.get(cell + offset) else {
+            continue;
+        };
+        let Ok(particle) = kinds.get(entity) else {
+            continue;
+        };
+        if particle.kind == kind {
+            return true;
+        }
+    }
+    false
+}
+
+fn would_have_same_kind_neighbor_after_move(
+    to: IVec3,
+    from: IVec3,
+    kind: ParticleKind,
+    grid: &VoxelGrid,
+    kinds: &Query<&Particle>,
+) -> bool {
+    for offset in CONNECTED_NEIGHBORS {
+        let neighbor = to + offset;
+        if neighbor == from {
+            continue;
+        }
+        let Some(entity) = grid.get(neighbor) else {
+            continue;
+        };
+        let Ok(particle) = kinds.get(entity) else {
+            continue;
+        };
+        if particle.kind == kind {
+            return true;
+        }
+    }
+    false
 }
 
 fn pack_cell(cell: IVec3) -> u64 {
