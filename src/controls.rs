@@ -84,6 +84,8 @@ pub fn select_kind(keys: Res<ButtonInput<KeyCode>>, mut selected: ResMut<Selecte
         (KeyCode::Digit6, ParticleKind::Lava),
         (KeyCode::Digit7, ParticleKind::Smoke),
         (KeyCode::Digit8, ParticleKind::Glass),
+        (KeyCode::Digit9, ParticleKind::WaterVapor),
+        (KeyCode::Digit0, ParticleKind::Fire),
     ];
 
     for (key, kind) in mappings {

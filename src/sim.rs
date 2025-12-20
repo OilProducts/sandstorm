@@ -1,6 +1,26 @@
 use bevy::prelude::*;
 use std::collections::HashSet;
 
+const FIRE_TTL: u8 = 20;
+
+const FIRE_IGNITE_OIL_PCT: u64 = 35;
+const FIRE_IGNITE_WOOD_PCT: u64 = 20;
+const LAVA_IGNITE_OIL_PCT: u64 = 30;
+const LAVA_IGNITE_WOOD_PCT: u64 = 12;
+
+const WATER_EVAPORATE_NEAR_FIRE_PCT: u64 = 18;
+const VAPOR_CONDENSE_PCT: u64 = 2;
+const SAND_GLASS_NEAR_LAVA_PCT: u64 = 22;
+
+const CARDINAL_NEIGHBORS: [IVec3; 6] = [
+    IVec3::new(1, 0, 0),
+    IVec3::new(-1, 0, 0),
+    IVec3::new(0, 1, 0),
+    IVec3::new(0, -1, 0),
+    IVec3::new(0, 0, 1),
+    IVec3::new(0, 0, -1),
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ParticleKind {
     Sand,
@@ -10,6 +30,8 @@ pub enum ParticleKind {
     Oil,
     Lava,
     Smoke,
+    WaterVapor,
+    Fire,
     Glass,
 }
 
@@ -23,12 +45,16 @@ impl ParticleKind {
             ParticleKind::Oil => "Oil",
             ParticleKind::Lava => "Lava",
             ParticleKind::Smoke => "Smoke",
+            ParticleKind::WaterVapor => "Water Vapor",
+            ParticleKind::Fire => "Fire",
             ParticleKind::Glass => "Glass",
         }
     }
 
     pub fn density(self) -> f32 {
         match self {
+            ParticleKind::Fire => 0.01,
+            ParticleKind::WaterVapor => 0.03,
             ParticleKind::Smoke => 0.05,
             ParticleKind::Oil => 0.8,
             ParticleKind::Water => 1.0,
@@ -49,8 +75,15 @@ impl ParticleKind {
 
     pub fn update_period(self) -> u64 {
         match self {
-            ParticleKind::Lava => 2,
-            _ => 1,
+            ParticleKind::Lava => 4,
+            _ => 2,
+        }
+    }
+
+    pub fn initial_ttl(self) -> u8 {
+        match self {
+            ParticleKind::Fire => FIRE_TTL,
+            _ => 0,
         }
     }
 }
@@ -58,6 +91,7 @@ impl ParticleKind {
 #[derive(Component, Debug, Clone, Copy)]
 pub struct Particle {
     pub kind: ParticleKind,
+    pub ttl: u8,
 }
 
 #[derive(Component, Debug, Clone, Copy)]
@@ -72,7 +106,7 @@ pub struct GridConfig {
 
 impl Default for GridConfig {
     fn default() -> Self {
-        let dims = UVec3::new(48, 48, 48);
+        let dims = UVec3::new(96, 96, 96);
         let cell_size = 0.25;
         let origin = Vec3::new(
             -(dims.x as f32) * cell_size * 0.5,
@@ -202,6 +236,8 @@ pub struct ParticlePalette {
     oil: Handle<StandardMaterial>,
     lava: Handle<StandardMaterial>,
     smoke: Handle<StandardMaterial>,
+    water_vapor: Handle<StandardMaterial>,
+    fire: Handle<StandardMaterial>,
     glass: Handle<StandardMaterial>,
 }
 
@@ -215,6 +251,8 @@ impl ParticlePalette {
             ParticleKind::Oil => self.oil.clone(),
             ParticleKind::Lava => self.lava.clone(),
             ParticleKind::Smoke => self.smoke.clone(),
+            ParticleKind::WaterVapor => self.water_vapor.clone(),
+            ParticleKind::Fire => self.fire.clone(),
             ParticleKind::Glass => self.glass.clone(),
         }
     }
@@ -228,6 +266,8 @@ impl ParticlePalette {
             ParticleKind::Oil => Color::srgba(0.18, 0.16, 0.05, 0.70),
             ParticleKind::Lava => Color::srgb(1.00, 0.35, 0.05),
             ParticleKind::Smoke => Color::srgba(0.60, 0.60, 0.60, 0.25),
+            ParticleKind::WaterVapor => Color::srgba(0.70, 0.88, 1.00, 0.22),
+            ParticleKind::Fire => Color::srgba(1.00, 0.55, 0.10, 0.80),
             ParticleKind::Glass => Color::srgba(0.60, 0.90, 1.00, 0.25),
         }
     }
@@ -276,6 +316,19 @@ impl FromWorld for ParticlePalette {
             unlit: true,
             ..default()
         });
+        let water_vapor = materials.add(StandardMaterial {
+            base_color: Self::base_color(ParticleKind::WaterVapor),
+            alpha_mode: AlphaMode::Blend,
+            unlit: true,
+            ..default()
+        });
+        let fire = materials.add(StandardMaterial {
+            base_color: Self::base_color(ParticleKind::Fire),
+            alpha_mode: AlphaMode::Blend,
+            emissive: LinearRgba::rgb(6.0, 2.0, 0.3),
+            unlit: true,
+            ..default()
+        });
         let glass = materials.add(StandardMaterial {
             base_color: Self::base_color(ParticleKind::Glass),
             alpha_mode: AlphaMode::Blend,
@@ -292,6 +345,8 @@ impl FromWorld for ParticlePalette {
             oil,
             lava,
             smoke,
+            water_vapor,
+            fire,
             glass,
         }
     }
@@ -316,7 +371,10 @@ pub fn spawn_particle(
     let world_pos = config.cell_center_world(cell);
     let entity = commands
         .spawn((
-            Particle { kind },
+            Particle {
+                kind,
+                ttl: kind.initial_ttl(),
+            },
             CellPos(cell),
             Mesh3d(meshes.cube.clone()),
             MeshMaterial3d(palette.material(kind)),
@@ -339,9 +397,14 @@ pub fn despawn_particle_at(commands: &mut Commands, grid: &mut VoxelGrid, cell: 
 pub fn simulate(
     mut grid: ResMut<VoxelGrid>,
     config: Res<GridConfig>,
+    palette: Res<ParticlePalette>,
     mut tick: ResMut<SimTick>,
-    kinds: Query<&Particle>,
-    mut particles: Query<(&Particle, &mut CellPos, &mut Transform)>,
+    mut particles: Query<(
+        &mut Particle,
+        &mut CellPos,
+        &mut Transform,
+        &mut MeshMaterial3d<StandardMaterial>,
+    )>,
     mut moved: Local<HashSet<Entity>>,
 ) {
     tick.0 = tick.0.wrapping_add(1);
@@ -352,10 +415,15 @@ pub fn simulate(
     let h = dims.y as i32;
     let d = dims.z as i32;
 
-    let x_forward = (tick.0 & 1) == 0;
-    let z_forward = (tick.0 & 2) == 0;
+    // Use a hashed tick so update throttling (e.g. period=2/4) doesn't lock some materials into a
+    // single scan direction and create visible drift/bias.
+    let order = hash_u64(tick.0);
+    let x_forward = (order & 1) == 0;
+    let z_forward = (order & 2) == 0;
+    let y_forward = (order & 4) == 0;
 
-    for y in 0..h {
+    for yi in 0..h {
+        let y = if y_forward { yi } else { h - 1 - yi };
         for xi in 0..w {
             let x = if x_forward { xi } else { w - 1 - xi };
             for zi in 0..d {
@@ -368,12 +436,13 @@ pub fn simulate(
                     continue;
                 }
 
-                let Ok(particle) = kinds.get(entity) else {
-                    grid.set(cell, None);
-                    continue;
+                let kind = {
+                    let Ok((particle, _, _, _)) = particles.get_mut(entity) else {
+                        grid.set(cell, None);
+                        continue;
+                    };
+                    particle.kind
                 };
-
-                let kind = particle.kind;
                 if kind.is_static() {
                     continue;
                 }
@@ -390,7 +459,7 @@ pub fn simulate(
                         tick.0,
                         &mut grid,
                         *config,
-                        &kinds,
+                        &palette,
                         &mut particles,
                         &mut *moved,
                     ),
@@ -401,7 +470,7 @@ pub fn simulate(
                         tick.0,
                         &mut grid,
                         *config,
-                        &kinds,
+                        &palette,
                         &mut particles,
                         &mut *moved,
                     ),
@@ -412,7 +481,29 @@ pub fn simulate(
                         tick.0,
                         &mut grid,
                         *config,
-                        &kinds,
+                        &palette,
+                        &mut particles,
+                        &mut *moved,
+                    ),
+                    ParticleKind::WaterVapor => step_water_vapor(
+                        entity,
+                        cell,
+                        kind,
+                        tick.0,
+                        &mut grid,
+                        *config,
+                        &palette,
+                        &mut particles,
+                        &mut *moved,
+                    ),
+                    ParticleKind::Fire => step_fire(
+                        entity,
+                        cell,
+                        kind,
+                        tick.0,
+                        &mut grid,
+                        *config,
+                        &palette,
                         &mut particles,
                         &mut *moved,
                     ),
@@ -434,11 +525,38 @@ fn step_sand(
     tick: u64,
     grid: &mut VoxelGrid,
     config: GridConfig,
-    kinds: &Query<&Particle>,
-    particles: &mut Query<(&Particle, &mut CellPos, &mut Transform)>,
+    palette: &ParticlePalette,
+    particles: &mut Query<(
+        &mut Particle,
+        &mut CellPos,
+        &mut Transform,
+        &mut MeshMaterial3d<StandardMaterial>,
+    )>,
     moved: &mut HashSet<Entity>,
 ) -> bool {
     let down = IVec3::new(0, -1, 0);
+
+    let below_is_lava = match grid.get(cell + down) {
+        None => false,
+        Some(below) => match particles.get_mut(below) {
+            Ok((particle, _cell_pos, _transform, _mat)) => particle.kind == ParticleKind::Lava,
+            Err(_) => {
+                grid.set(cell + down, None);
+                false
+            }
+        },
+    };
+    if below_is_lava && chance_percent((tick << 9) ^ pack_cell(cell), SAND_GLASS_NEAR_LAVA_PCT) {
+        let Ok((mut particle, _cell_pos, _transform, mut mat)) = particles.get_mut(entity) else {
+            grid.set(cell, None);
+            return false;
+        };
+        particle.kind = ParticleKind::Glass;
+        particle.ttl = ParticleKind::Glass.initial_ttl();
+        *mat = MeshMaterial3d(palette.material(ParticleKind::Glass));
+        return true;
+    }
+
     if try_move_or_swap(
         entity,
         cell,
@@ -446,7 +564,7 @@ fn step_sand(
         kind,
         grid,
         config,
-        kinds,
+        palette,
         particles,
         moved,
     ) {
@@ -455,13 +573,13 @@ fn step_sand(
 
     const OFFSETS: [IVec3; 8] = [
         IVec3::new(1, -1, 0),
-        IVec3::new(-1, -1, 0),
-        IVec3::new(0, -1, 1),
-        IVec3::new(0, -1, -1),
         IVec3::new(1, -1, 1),
-        IVec3::new(1, -1, -1),
+        IVec3::new(0, -1, 1),
         IVec3::new(-1, -1, 1),
+        IVec3::new(-1, -1, 0),
         IVec3::new(-1, -1, -1),
+        IVec3::new(0, -1, -1),
+        IVec3::new(1, -1, -1),
     ];
 
     let start = (hash_u64(tick ^ pack_cell(cell)) as usize) % OFFSETS.len();
@@ -474,7 +592,7 @@ fn step_sand(
             kind,
             grid,
             config,
-            kinds,
+            palette,
             particles,
             moved,
         ) {
@@ -492,10 +610,94 @@ fn step_fluid(
     tick: u64,
     grid: &mut VoxelGrid,
     config: GridConfig,
-    kinds: &Query<&Particle>,
-    particles: &mut Query<(&Particle, &mut CellPos, &mut Transform)>,
+    palette: &ParticlePalette,
+    particles: &mut Query<(
+        &mut Particle,
+        &mut CellPos,
+        &mut Transform,
+        &mut MeshMaterial3d<StandardMaterial>,
+    )>,
     moved: &mut HashSet<Entity>,
 ) -> bool {
+    if kind == ParticleKind::Water {
+        let mut near_fire = false;
+        for offset in CARDINAL_NEIGHBORS {
+            let Some(other) = grid.get(cell + offset) else {
+                continue;
+            };
+            let Ok((other_particle, _cell_pos, _transform, _mat)) = particles.get_mut(other) else {
+                grid.set(cell + offset, None);
+                continue;
+            };
+            if other_particle.kind == ParticleKind::Fire {
+                near_fire = true;
+                break;
+            }
+        }
+
+        if near_fire
+            && chance_percent((tick << 10) ^ pack_cell(cell), WATER_EVAPORATE_NEAR_FIRE_PCT)
+        {
+            let Ok((mut particle, _cell_pos, _transform, mut mat)) = particles.get_mut(entity)
+            else {
+                grid.set(cell, None);
+                return false;
+            };
+            particle.kind = ParticleKind::WaterVapor;
+            particle.ttl = ParticleKind::WaterVapor.initial_ttl();
+            *mat = MeshMaterial3d(palette.material(ParticleKind::WaterVapor));
+            return true;
+        }
+    }
+
+    if kind == ParticleKind::Lava {
+        let start = (hash_u64((tick << 11) ^ pack_cell(cell)) as usize) % CARDINAL_NEIGHBORS.len();
+        for i in 0..CARDINAL_NEIGHBORS.len() {
+            let offset = CARDINAL_NEIGHBORS[(start + i) % CARDINAL_NEIGHBORS.len()];
+            let other_cell = cell + offset;
+            let Some(other) = grid.get(other_cell) else {
+                continue;
+            };
+            if moved.contains(&other) {
+                continue;
+            }
+            let Ok((mut other_particle, _cell_pos, _transform, mut mat)) =
+                particles.get_mut(other)
+            else {
+                grid.set(other_cell, None);
+                continue;
+            };
+
+            let new_kind = match other_particle.kind {
+                ParticleKind::Oil => chance_percent(
+                    (tick << 12) ^ pack_cell(other_cell),
+                    LAVA_IGNITE_OIL_PCT,
+                )
+                .then_some(ParticleKind::Fire),
+                ParticleKind::Wood => chance_percent(
+                    (tick << 12) ^ pack_cell(other_cell),
+                    LAVA_IGNITE_WOOD_PCT,
+                )
+                .then_some(ParticleKind::Fire),
+                ParticleKind::Sand => chance_percent(
+                    (tick << 12) ^ pack_cell(other_cell),
+                    SAND_GLASS_NEAR_LAVA_PCT,
+                )
+                .then_some(ParticleKind::Glass),
+                _ => None,
+            };
+            let Some(new_kind) = new_kind else {
+                continue;
+            };
+
+            other_particle.kind = new_kind;
+            other_particle.ttl = new_kind.initial_ttl();
+            *mat = MeshMaterial3d(palette.material(new_kind));
+            moved.insert(other);
+            break;
+        }
+    }
+
     let down = IVec3::new(0, -1, 0);
     if try_move_or_swap(
         entity,
@@ -504,7 +706,7 @@ fn step_fluid(
         kind,
         grid,
         config,
-        kinds,
+        palette,
         particles,
         moved,
     ) {
@@ -513,23 +715,23 @@ fn step_fluid(
 
     const OFFSETS_DOWN: [IVec3; 8] = [
         IVec3::new(1, -1, 0),
-        IVec3::new(-1, -1, 0),
-        IVec3::new(0, -1, 1),
-        IVec3::new(0, -1, -1),
         IVec3::new(1, -1, 1),
-        IVec3::new(1, -1, -1),
+        IVec3::new(0, -1, 1),
         IVec3::new(-1, -1, 1),
+        IVec3::new(-1, -1, 0),
         IVec3::new(-1, -1, -1),
+        IVec3::new(0, -1, -1),
+        IVec3::new(1, -1, -1),
     ];
     const OFFSETS_SIDE: [IVec3; 8] = [
         IVec3::new(1, 0, 0),
-        IVec3::new(-1, 0, 0),
-        IVec3::new(0, 0, 1),
-        IVec3::new(0, 0, -1),
         IVec3::new(1, 0, 1),
-        IVec3::new(1, 0, -1),
+        IVec3::new(0, 0, 1),
         IVec3::new(-1, 0, 1),
+        IVec3::new(-1, 0, 0),
         IVec3::new(-1, 0, -1),
+        IVec3::new(0, 0, -1),
+        IVec3::new(1, 0, -1),
     ];
 
     let start_down = (hash_u64((tick << 1) ^ pack_cell(cell)) as usize) % OFFSETS_DOWN.len();
@@ -542,7 +744,7 @@ fn step_fluid(
             kind,
             grid,
             config,
-            kinds,
+            palette,
             particles,
             moved,
         ) {
@@ -555,7 +757,7 @@ fn step_fluid(
     // - there is something above this cell (pressure), or
     // - this particle is connected to at least one same-kind neighbor, and the move keeps it connected.
     let has_above = grid.get(cell + IVec3::Y).is_some();
-    if !has_above && !has_same_kind_neighbor(cell, kind, grid, kinds) {
+    if !has_above && !has_same_kind_neighbor(cell, kind, grid, particles) {
         return false;
     }
 
@@ -563,12 +765,11 @@ fn step_fluid(
     for i in 0..OFFSETS_SIDE.len() {
         let offset = OFFSETS_SIDE[(start_side + i) % OFFSETS_SIDE.len()];
         let to = cell + offset;
-        if !has_above && !would_have_same_kind_neighbor_after_move(to, cell, kind, grid, kinds) {
+        if !has_above && !would_have_same_kind_neighbor_after_move(to, cell, kind, grid, particles)
+        {
             continue;
         }
-        if try_move_or_swap(
-            entity, cell, to, kind, grid, config, kinds, particles, moved,
-        ) {
+        if try_move_or_swap(entity, cell, to, kind, grid, config, palette, particles, moved) {
             return true;
         }
     }
@@ -583,8 +784,13 @@ fn step_smoke(
     tick: u64,
     grid: &mut VoxelGrid,
     config: GridConfig,
-    kinds: &Query<&Particle>,
-    particles: &mut Query<(&Particle, &mut CellPos, &mut Transform)>,
+    palette: &ParticlePalette,
+    particles: &mut Query<(
+        &mut Particle,
+        &mut CellPos,
+        &mut Transform,
+        &mut MeshMaterial3d<StandardMaterial>,
+    )>,
     moved: &mut HashSet<Entity>,
 ) -> bool {
     let up = IVec3::new(0, 1, 0);
@@ -595,7 +801,7 @@ fn step_smoke(
         kind,
         grid,
         config,
-        kinds,
+        palette,
         particles,
         moved,
     ) {
@@ -604,23 +810,23 @@ fn step_smoke(
 
     const OFFSETS_UP: [IVec3; 8] = [
         IVec3::new(1, 1, 0),
-        IVec3::new(-1, 1, 0),
-        IVec3::new(0, 1, 1),
-        IVec3::new(0, 1, -1),
         IVec3::new(1, 1, 1),
-        IVec3::new(1, 1, -1),
+        IVec3::new(0, 1, 1),
         IVec3::new(-1, 1, 1),
+        IVec3::new(-1, 1, 0),
         IVec3::new(-1, 1, -1),
+        IVec3::new(0, 1, -1),
+        IVec3::new(1, 1, -1),
     ];
     const OFFSETS_SIDE: [IVec3; 8] = [
         IVec3::new(1, 0, 0),
-        IVec3::new(-1, 0, 0),
-        IVec3::new(0, 0, 1),
-        IVec3::new(0, 0, -1),
         IVec3::new(1, 0, 1),
-        IVec3::new(1, 0, -1),
+        IVec3::new(0, 0, 1),
         IVec3::new(-1, 0, 1),
+        IVec3::new(-1, 0, 0),
         IVec3::new(-1, 0, -1),
+        IVec3::new(0, 0, -1),
+        IVec3::new(1, 0, -1),
     ];
 
     let start_up = (hash_u64((tick << 3) ^ pack_cell(cell)) as usize) % OFFSETS_UP.len();
@@ -633,7 +839,7 @@ fn step_smoke(
             kind,
             grid,
             config,
-            kinds,
+            palette,
             particles,
             moved,
         ) {
@@ -651,7 +857,290 @@ fn step_smoke(
             kind,
             grid,
             config,
-            kinds,
+            palette,
+            particles,
+            moved,
+        ) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn step_water_vapor(
+    entity: Entity,
+    cell: IVec3,
+    kind: ParticleKind,
+    tick: u64,
+    grid: &mut VoxelGrid,
+    config: GridConfig,
+    palette: &ParticlePalette,
+    particles: &mut Query<(
+        &mut Particle,
+        &mut CellPos,
+        &mut Transform,
+        &mut MeshMaterial3d<StandardMaterial>,
+    )>,
+    moved: &mut HashSet<Entity>,
+) -> bool {
+    let mut near_heat = false;
+    for offset in CARDINAL_NEIGHBORS {
+        let Some(other) = grid.get(cell + offset) else {
+            continue;
+        };
+        let Ok((other_particle, _cell_pos, _transform, _mat)) = particles.get_mut(other) else {
+            grid.set(cell + offset, None);
+            continue;
+        };
+        if matches!(other_particle.kind, ParticleKind::Fire | ParticleKind::Lava) {
+            near_heat = true;
+            break;
+        }
+    }
+
+    let top_y = grid.dims.y as i32 - 1;
+    let blocked_above = cell.y >= top_y || grid.get(cell + IVec3::Y).is_some();
+    if blocked_above && !near_heat && chance_percent((tick << 13) ^ pack_cell(cell), VAPOR_CONDENSE_PCT)
+    {
+        let Ok((mut particle, _cell_pos, _transform, mut mat)) = particles.get_mut(entity) else {
+            grid.set(cell, None);
+            return false;
+        };
+        particle.kind = ParticleKind::Water;
+        particle.ttl = ParticleKind::Water.initial_ttl();
+        *mat = MeshMaterial3d(palette.material(ParticleKind::Water));
+        return true;
+    }
+
+    let up = IVec3::new(0, 1, 0);
+    if try_move_or_swap(
+        entity,
+        cell,
+        cell + up,
+        kind,
+        grid,
+        config,
+        palette,
+        particles,
+        moved,
+    ) {
+        return true;
+    }
+
+    const OFFSETS_UP: [IVec3; 8] = [
+        IVec3::new(1, 1, 0),
+        IVec3::new(1, 1, 1),
+        IVec3::new(0, 1, 1),
+        IVec3::new(-1, 1, 1),
+        IVec3::new(-1, 1, 0),
+        IVec3::new(-1, 1, -1),
+        IVec3::new(0, 1, -1),
+        IVec3::new(1, 1, -1),
+    ];
+    const OFFSETS_SIDE: [IVec3; 8] = [
+        IVec3::new(1, 0, 0),
+        IVec3::new(1, 0, 1),
+        IVec3::new(0, 0, 1),
+        IVec3::new(-1, 0, 1),
+        IVec3::new(-1, 0, 0),
+        IVec3::new(-1, 0, -1),
+        IVec3::new(0, 0, -1),
+        IVec3::new(1, 0, -1),
+    ];
+
+    let start_up = (hash_u64((tick << 5) ^ pack_cell(cell)) as usize) % OFFSETS_UP.len();
+    for i in 0..OFFSETS_UP.len() {
+        let offset = OFFSETS_UP[(start_up + i) % OFFSETS_UP.len()];
+        if try_move_or_swap(
+            entity,
+            cell,
+            cell + offset,
+            kind,
+            grid,
+            config,
+            palette,
+            particles,
+            moved,
+        ) {
+            return true;
+        }
+    }
+
+    let start_side = (hash_u64((tick << 6) ^ pack_cell(cell)) as usize) % OFFSETS_SIDE.len();
+    for i in 0..OFFSETS_SIDE.len() {
+        let offset = OFFSETS_SIDE[(start_side + i) % OFFSETS_SIDE.len()];
+        if try_move_or_swap(
+            entity,
+            cell,
+            cell + offset,
+            kind,
+            grid,
+            config,
+            palette,
+            particles,
+            moved,
+        ) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn step_fire(
+    entity: Entity,
+    cell: IVec3,
+    kind: ParticleKind,
+    tick: u64,
+    grid: &mut VoxelGrid,
+    config: GridConfig,
+    palette: &ParticlePalette,
+    particles: &mut Query<(
+        &mut Particle,
+        &mut CellPos,
+        &mut Transform,
+        &mut MeshMaterial3d<StandardMaterial>,
+    )>,
+    moved: &mut HashSet<Entity>,
+) -> bool {
+    {
+        let Ok((mut particle, _cell_pos, _transform, mut mat)) = particles.get_mut(entity) else {
+            grid.set(cell, None);
+            return false;
+        };
+
+        particle.ttl = particle.ttl.saturating_sub(1);
+        if particle.ttl == 0 {
+            particle.kind = ParticleKind::Smoke;
+            *mat = MeshMaterial3d(palette.material(ParticleKind::Smoke));
+            return true;
+        }
+    }
+
+    let mut has_water_neighbor = false;
+    for offset in CARDINAL_NEIGHBORS {
+        let Some(other) = grid.get(cell + offset) else {
+            continue;
+        };
+        let Ok((other_particle, _cell_pos, _transform, _mat)) = particles.get_mut(other) else {
+            grid.set(cell + offset, None);
+            continue;
+        };
+        if other_particle.kind == ParticleKind::Water {
+            has_water_neighbor = true;
+            break;
+        }
+    }
+    if has_water_neighbor {
+        let Ok((mut particle, _cell_pos, _transform, mut mat)) = particles.get_mut(entity) else {
+            grid.set(cell, None);
+            return false;
+        };
+        particle.kind = ParticleKind::WaterVapor;
+        particle.ttl = ParticleKind::WaterVapor.initial_ttl();
+        *mat = MeshMaterial3d(palette.material(ParticleKind::WaterVapor));
+        return true;
+    }
+
+    let start =
+        (hash_u64((tick << 14) ^ pack_cell(cell)) as usize) % CARDINAL_NEIGHBORS.len();
+    for i in 0..CARDINAL_NEIGHBORS.len() {
+        let offset = CARDINAL_NEIGHBORS[(start + i) % CARDINAL_NEIGHBORS.len()];
+        let other_cell = cell + offset;
+        let Some(other) = grid.get(other_cell) else {
+            continue;
+        };
+        if moved.contains(&other) {
+            continue;
+        }
+        let Ok((mut other_particle, _cell_pos, _transform, mut mat)) = particles.get_mut(other)
+        else {
+            grid.set(other_cell, None);
+            continue;
+        };
+
+        let ignite_pct = match other_particle.kind {
+            ParticleKind::Oil => FIRE_IGNITE_OIL_PCT,
+            ParticleKind::Wood => FIRE_IGNITE_WOOD_PCT,
+            _ => continue,
+        };
+        if !chance_percent((tick << 15) ^ pack_cell(other_cell), ignite_pct) {
+            continue;
+        }
+
+        other_particle.kind = ParticleKind::Fire;
+        other_particle.ttl = ParticleKind::Fire.initial_ttl();
+        *mat = MeshMaterial3d(palette.material(ParticleKind::Fire));
+        moved.insert(other);
+        break;
+    }
+
+    let up = IVec3::new(0, 1, 0);
+    if try_move_or_swap(
+        entity,
+        cell,
+        cell + up,
+        kind,
+        grid,
+        config,
+        palette,
+        particles,
+        moved,
+    ) {
+        return true;
+    }
+
+    const OFFSETS_UP: [IVec3; 8] = [
+        IVec3::new(1, 1, 0),
+        IVec3::new(1, 1, 1),
+        IVec3::new(0, 1, 1),
+        IVec3::new(-1, 1, 1),
+        IVec3::new(-1, 1, 0),
+        IVec3::new(-1, 1, -1),
+        IVec3::new(0, 1, -1),
+        IVec3::new(1, 1, -1),
+    ];
+    const OFFSETS_SIDE: [IVec3; 8] = [
+        IVec3::new(1, 0, 0),
+        IVec3::new(1, 0, 1),
+        IVec3::new(0, 0, 1),
+        IVec3::new(-1, 0, 1),
+        IVec3::new(-1, 0, 0),
+        IVec3::new(-1, 0, -1),
+        IVec3::new(0, 0, -1),
+        IVec3::new(1, 0, -1),
+    ];
+
+    let start_up = (hash_u64((tick << 7) ^ pack_cell(cell)) as usize) % OFFSETS_UP.len();
+    for i in 0..OFFSETS_UP.len() {
+        let offset = OFFSETS_UP[(start_up + i) % OFFSETS_UP.len()];
+        if try_move_or_swap(
+            entity,
+            cell,
+            cell + offset,
+            kind,
+            grid,
+            config,
+            palette,
+            particles,
+            moved,
+        ) {
+            return true;
+        }
+    }
+
+    let start_side = (hash_u64((tick << 8) ^ pack_cell(cell)) as usize) % OFFSETS_SIDE.len();
+    for i in 0..OFFSETS_SIDE.len() {
+        let offset = OFFSETS_SIDE[(start_side + i) % OFFSETS_SIDE.len()];
+        if try_move_or_swap(
+            entity,
+            cell,
+            cell + offset,
+            kind,
+            grid,
+            config,
+            palette,
             particles,
             moved,
         ) {
@@ -669,8 +1158,13 @@ fn try_move_or_swap(
     mover_kind: ParticleKind,
     grid: &mut VoxelGrid,
     config: GridConfig,
-    kinds: &Query<&Particle>,
-    particles: &mut Query<(&Particle, &mut CellPos, &mut Transform)>,
+    palette: &ParticlePalette,
+    particles: &mut Query<(
+        &mut Particle,
+        &mut CellPos,
+        &mut Transform,
+        &mut MeshMaterial3d<StandardMaterial>,
+    )>,
     moved: &mut HashSet<Entity>,
 ) -> bool {
     if !grid.in_bounds(to) {
@@ -684,7 +1178,7 @@ fn try_move_or_swap(
 
     match grid.get(to) {
         None => {
-            if let Ok((_p, mut cell_pos, mut transform)) = particles.get_mut(entity) {
+            if let Ok((_p, mut cell_pos, mut transform, _mat)) = particles.get_mut(entity) {
                 cell_pos.0 = to;
                 transform.translation = config.cell_center_world(to);
                 grid.set(from, None);
@@ -697,11 +1191,79 @@ fn try_move_or_swap(
             if other == entity || moved.contains(&other) {
                 return false;
             }
-            let Ok(other_particle) = kinds.get(other) else {
-                grid.set(to, None);
+
+            let Ok([mut mover, mut target]) = particles.get_many_mut([entity, other]) else {
+                if particles.get_mut(entity).is_err() {
+                    grid.set(from, None);
+                }
+                if particles.get_mut(other).is_err() {
+                    grid.set(to, None);
+                }
                 return false;
             };
-            let other_kind = other_particle.kind;
+
+            let other_kind = target.0.kind;
+
+            if mover_kind == ParticleKind::Fire && other_kind == ParticleKind::Water {
+                mover.0.kind = ParticleKind::WaterVapor;
+                mover.0.ttl = ParticleKind::WaterVapor.initial_ttl();
+                *mover.3 = MeshMaterial3d(palette.material(ParticleKind::WaterVapor));
+                return true;
+            }
+
+            let mut other_kind = other_kind;
+            if mover_kind == ParticleKind::Water && other_kind == ParticleKind::Fire {
+                target.0.kind = ParticleKind::WaterVapor;
+                target.0.ttl = ParticleKind::WaterVapor.initial_ttl();
+                *target.3 = MeshMaterial3d(palette.material(ParticleKind::WaterVapor));
+                other_kind = ParticleKind::WaterVapor;
+            }
+
+            if (mover_kind == ParticleKind::Water && other_kind == ParticleKind::Lava)
+                || (mover_kind == ParticleKind::Lava && other_kind == ParticleKind::Water)
+            {
+                let vapor_y = if mover_kind == ParticleKind::Water {
+                    from.y
+                } else {
+                    to.y
+                };
+                let stone_y = if mover_kind == ParticleKind::Water {
+                    to.y
+                } else {
+                    from.y
+                };
+
+                if mover_kind == ParticleKind::Water {
+                    mover.0.kind = ParticleKind::WaterVapor;
+                    mover.0.ttl = ParticleKind::WaterVapor.initial_ttl();
+                    *mover.3 = MeshMaterial3d(palette.material(ParticleKind::WaterVapor));
+
+                    target.0.kind = ParticleKind::Stone;
+                    target.0.ttl = ParticleKind::Stone.initial_ttl();
+                    *target.3 = MeshMaterial3d(palette.material(ParticleKind::Stone));
+                } else {
+                    mover.0.kind = ParticleKind::Stone;
+                    mover.0.ttl = ParticleKind::Stone.initial_ttl();
+                    *mover.3 = MeshMaterial3d(palette.material(ParticleKind::Stone));
+
+                    target.0.kind = ParticleKind::WaterVapor;
+                    target.0.ttl = ParticleKind::WaterVapor.initial_ttl();
+                    *target.3 = MeshMaterial3d(palette.material(ParticleKind::WaterVapor));
+                }
+
+                if vapor_y < stone_y {
+                    mover.1.0 = to;
+                    mover.2.translation = config.cell_center_world(to);
+                    target.1.0 = from;
+                    target.2.translation = config.cell_center_world(from);
+                    grid.set(from, Some(other));
+                    grid.set(to, Some(entity));
+                }
+
+                moved.insert(other);
+                return true;
+            }
+
             if other_kind.is_static() {
                 return false;
             }
@@ -709,9 +1271,6 @@ fn try_move_or_swap(
                 return false;
             }
 
-            let Ok([mut mover, mut target]) = particles.get_many_mut([entity, other]) else {
-                return false;
-            };
             mover.1.0 = to;
             mover.2.translation = config.cell_center_world(to);
             target.1.0 = from;
@@ -741,13 +1300,18 @@ fn has_same_kind_neighbor(
     cell: IVec3,
     kind: ParticleKind,
     grid: &VoxelGrid,
-    kinds: &Query<&Particle>,
+    particles: &mut Query<(
+        &mut Particle,
+        &mut CellPos,
+        &mut Transform,
+        &mut MeshMaterial3d<StandardMaterial>,
+    )>,
 ) -> bool {
     for offset in CONNECTED_NEIGHBORS {
         let Some(entity) = grid.get(cell + offset) else {
             continue;
         };
-        let Ok(particle) = kinds.get(entity) else {
+        let Ok((particle, _cell_pos, _transform, _mat)) = particles.get_mut(entity) else {
             continue;
         };
         if particle.kind == kind {
@@ -762,7 +1326,12 @@ fn would_have_same_kind_neighbor_after_move(
     from: IVec3,
     kind: ParticleKind,
     grid: &VoxelGrid,
-    kinds: &Query<&Particle>,
+    particles: &mut Query<(
+        &mut Particle,
+        &mut CellPos,
+        &mut Transform,
+        &mut MeshMaterial3d<StandardMaterial>,
+    )>,
 ) -> bool {
     for offset in CONNECTED_NEIGHBORS {
         let neighbor = to + offset;
@@ -772,7 +1341,7 @@ fn would_have_same_kind_neighbor_after_move(
         let Some(entity) = grid.get(neighbor) else {
             continue;
         };
-        let Ok(particle) = kinds.get(entity) else {
+        let Ok((particle, _cell_pos, _transform, _mat)) = particles.get_mut(entity) else {
             continue;
         };
         if particle.kind == kind {
@@ -780,6 +1349,10 @@ fn would_have_same_kind_neighbor_after_move(
         }
     }
     false
+}
+
+fn chance_percent(seed: u64, percent: u64) -> bool {
+    percent > 0 && (hash_u64(seed) % 100) < percent
 }
 
 fn pack_cell(cell: IVec3) -> u64 {

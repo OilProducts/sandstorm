@@ -81,7 +81,7 @@ Tab: toggle mouse capture ({lock_state})\n\
 WASD + Space/Shift: fly  |  Ctrl: boost\n\
 LMB: place  |  RMB: erase\n\
 Mouse Wheel: brush radius ({brush_radius})\n\
-1 Sand  2 Water  3 Stone  4 Wood  5 Oil  6 Lava  7 Smoke  8 Glass\n\
+1 Sand  2 Water  3 Stone  4 Wood  5 Oil  6 Lava  7 Smoke  8 Glass  9 Vapor  0 Fire\n\
 Selected: {name}\n\
 Particles: {count}\n\
 R: clear",

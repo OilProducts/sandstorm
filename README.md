@@ -17,7 +17,7 @@ cargo run
 - `Mouse Wheel`: change brush radius
 - `LMB`: place selected particle
 - `RMB`: erase particles
-- `1..8`: select material (Sand, Water, Stone, Wood, Oil, Lava, Smoke, Glass)
+- `1..9` / `0`: select material (Sand, Water, Stone, Wood, Oil, Lava, Smoke, Glass, Water Vapor, Fire)
 - `R`: clear the simulation
 - `Esc`: release mouse capture
 
@@ -38,10 +38,12 @@ This is intentionally “game-y” rather than physically accurate. The rules ar
 | **Wood** | Static solid | Never moves | Blocks all motion |
 | **Glass** | Static solid | Never moves | Blocks all motion (rendered translucent) |
 | **Sand** | Granular | Falls down; if blocked, tries diagonal down moves | Sinks through lower-density fluids via density swap |
-| **Water** | Fluid | Falls, then spreads sideways | Displaces smoke; oil tends to float on top of water |
+| **Water** | Fluid | Falls, then spreads sideways | Displaces smoke; oil tends to float on top of water; can boil into water vapor near fire |
 | **Oil** | Fluid | Like water, but lighter | Floats on water (water can swap into oil) |
-| **Lava** | Fluid | Like water, but heavier and slower | Sinks through most non-static materials; rendered emissive (“glows”) |
-| **Smoke** | Gas | Rises, then drifts sideways | Gets displaced by fluids/sand; can’t push through denser particles |
+| **Lava** | Fluid | Like water, but heavier and slower | Ignites nearby oil/wood; cools into stone on contact with water; rendered emissive (“glows”) |
+| **Smoke** | Gas | Rises, then drifts sideways | Gets displaced by fluids/sand; can’t push through denser particles; produced when fire burns out |
+| **Water Vapor** | Gas | Rises, then drifts sideways | Gets displaced by fluids/sand; can condense into water away from heat |
+| **Fire** | Gas / energy | Rises and flickers | Ignites oil/wood; turns into smoke over time; extinguished by water (creates water vapor) |
 
 ### “Emissive” note (lava)
 
@@ -51,4 +53,3 @@ Lava uses `StandardMaterial.emissive`, meaning it renders as self-lit and stays 
 
 - Grid size and cell size are in `src/sim.rs` (`GridConfig`).
 - Movement rules are in `src/sim.rs` (`step_sand`, `step_fluid`, `step_smoke`).
-
